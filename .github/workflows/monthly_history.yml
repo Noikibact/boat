@@ -1,0 +1,71 @@
+name: BOATRACE monthly 5y history
+
+on:
+  schedule:
+    # 毎日00:15 JSTに軽量起動。1日だけ本更新し、他日はキャッシュを触って失効を防ぐ。
+    - cron: '15 15 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Restore rolling history cache
+        id: cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: history_state
+          key: boatrace-history-probe-${{ github.run_id }}
+          restore-keys: |
+            boatrace-history-
+
+      - name: Decide whether to run monthly update
+        id: gate
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$(TZ=Asia/Tokyo date +%d)" = "01" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Cache keep-alive only. JST date=$(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
+          fi
+
+      - name: Install dependencies
+        if: steps.gate.outputs.run == 'true'
+        run: python -m pip install -r requirements.txt
+
+      - name: Build rolling 5-year history and upload
+        if: steps.gate.outputs.run == 'true'
+        env:
+          HISTORY_ENDPOINT_URL: ${{ secrets.HISTORY_ENDPOINT_URL }}
+          HISTORY_TOKEN: ${{ secrets.HISTORY_TOKEN }}
+        run: |
+          python build_boatrace_history_v3_3.py --rolling --out history_state
+
+      - name: Save updated rolling cache
+        if: steps.gate.outputs.run == 'true' && success()
+        uses: actions/cache/save@v4
+        with:
+          path: history_state
+          key: boatrace-history-${{ github.run_id }}
+
+      - name: Upload diagnostic summary
+        if: steps.gate.outputs.run == 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boatrace-history-summary-${{ github.run_id }}
+          path: |
+            history_state/BUILD_SUMMARY.txt
+            history_state/BR_history_meta.csv
+          if-no-files-found: ignore
+          retention-days: 30
