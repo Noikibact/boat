@@ -1,0 +1,63 @@
+name: BOATRACE v4 shadow model
+
+on:
+  schedule:
+    # 毎月2日 01:30 JST。1日の5年履歴更新完了後に学習する。
+    - cron: '30 16 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Restore latest rolling history cache
+        id: cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: history_state
+          key: boatrace-v4-model-probe-${{ github.run_id }}
+          restore-keys: |
+            boatrace-history-
+
+      - name: Verify history cache
+        shell: bash
+        run: |
+          test -f history_state/boatrace_history.sqlite || {
+            echo 'history_state/boatrace_history.sqlite がありません。先に BOATRACE monthly 5y history を成功させてください。'
+            exit 1
+          }
+          ls -lh history_state/boatrace_history.sqlite
+
+      - name: Install v4 dependencies
+        run: python -m pip install -r requirements_v4.txt
+
+      - name: Train leakage-safe shadow models and upload
+        env:
+          HISTORY_ENDPOINT_URL: ${{ secrets.HISTORY_ENDPOINT_URL }}
+          HISTORY_TOKEN: ${{ secrets.HISTORY_TOKEN }}
+        run: |
+          python train_boatrace_model_v4.py \
+            --db history_state/boatrace_history.sqlite \
+            --out model_v4
+
+      - name: Upload model diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boatrace-v4-model-${{ github.run_id }}
+          path: |
+            model_v4/BR_model_v4_coefficients.csv
+            model_v4/BR_model_v4_meta.csv
+            model_v4/V4_MODEL_SUMMARY.txt
+          if-no-files-found: ignore
+          retention-days: 90
