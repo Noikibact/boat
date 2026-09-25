@@ -12,7 +12,7 @@ permissions:
 jobs:
   model:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
 
@@ -41,7 +41,7 @@ jobs:
       - name: Install v4 dependencies
         run: python -m pip install -r requirements_v4.txt
 
-      - name: Train leakage-safe shadow models and upload
+      - name: Train leakage-safe Softmax+Temperature shadow models and upload
         env:
           HISTORY_ENDPOINT_URL: ${{ secrets.HISTORY_ENDPOINT_URL }}
           HISTORY_TOKEN: ${{ secrets.HISTORY_TOKEN }}
