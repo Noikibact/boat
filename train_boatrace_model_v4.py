@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-BOAT RACE v4.0 shadow prediction model trainer
+BOAT RACE v4.0.1 calibrated shadow prediction model trainer
 
 Purpose
 -------
@@ -21,7 +21,7 @@ BASE    : history + venue + boat/course proxy.  Usable as soon as the race list 
 WEATHER : BASE + current wind + venue/course/wind historical condition stats.
           Intended for the live stage after wind data is available.
 
-The v4.0 model does not use motor, national/local official rating fields, or exhibition
+The v4.0.1 model does not use motor, national/local official rating fields, or exhibition
 metrics because the 5-year K-data cache does not contain leakage-safe historical values
 for those fields.  They can be added later after the live shadow log has accumulated.
 """
@@ -46,7 +46,7 @@ import numpy as np
 import requests
 from sklearn.linear_model import SGDClassifier
 
-VERSION = "4.0.0-shadow-sgd"
+VERSION = "4.0.1-shadow-softmax-temp"
 
 VENUE_CODES = [f"{i:02d}" for i in range(1, 25)]
 WIND_DIRS = ["無風", "北東", "南東", "南西", "北西", "北", "東", "南", "西"]
@@ -93,9 +93,49 @@ def parse_iso_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
-def sigmoid(z: np.ndarray) -> np.ndarray:
-    z = np.clip(z, -30.0, 30.0)
-    return 1.0 / (1.0 + np.exp(-z))
+def softmax_scores(scores: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+    """Race-level softmax over six boat logits. Common score shifts cancel out."""
+    x = np.asarray(scores, dtype=float)
+    if x.size == 0:
+        return x
+    t = float(temperature) if temperature and math.isfinite(float(temperature)) else 1.0
+    t = max(0.10, min(t, 50.0))
+    x = x / t
+    x = x - np.max(x)
+    e = np.exp(np.clip(x, -80.0, 0.0))
+    s = float(e.sum())
+    if not math.isfinite(s) or s <= 0:
+        return np.ones(len(x), dtype=float) / len(x)
+    return e / s
+
+
+def fit_temperature(samples: List[Tuple[np.ndarray, int]]) -> float:
+    """Fit one scalar temperature on an earlier calibration segment by race log loss."""
+    if not samples:
+        return 1.0
+
+    def loss(t: float) -> float:
+        total = 0.0
+        n = 0
+        for scores, winner_idx in samples:
+            p = softmax_scores(scores, t)
+            wp = max(float(p[winner_idx]), 1e-12)
+            total += -math.log(wp)
+            n += 1
+        return total / max(n, 1)
+
+    # Broad deterministic search; no extra scipy dependency is needed.
+    grid = np.exp(np.linspace(math.log(0.25), math.log(20.0), 241))
+    vals = np.asarray([loss(float(t)) for t in grid])
+    best_i = int(np.argmin(vals))
+    best = float(grid[best_i])
+
+    # Local refinement around the best log-temperature.
+    lo = max(0.10, best / 1.35)
+    hi = min(50.0, best * 1.35)
+    fine = np.exp(np.linspace(math.log(lo), math.log(hi), 161))
+    fine_vals = np.asarray([loss(float(t)) for t in fine])
+    return float(fine[int(np.argmin(fine_vals))])
 
 
 def scale_starts(n: int) -> float:
@@ -432,16 +472,14 @@ class OnlineModel:
         self.xbuf.clear()
         self.ybuf.clear()
 
-    def race_probs(self, xs: List[np.ndarray]) -> np.ndarray:
+    def race_scores(self, xs: List[np.ndarray]) -> np.ndarray:
         if not self.fitted:
-            return np.ones(len(xs), dtype=float) / len(xs)
+            return np.zeros(len(xs), dtype=float)
         X = np.vstack(xs)
-        # predict_proba is available for SGDClassifier(log_loss)
-        p = self.clf.predict_proba(X)[:, 1].astype(float)
-        s = float(p.sum())
-        if not math.isfinite(s) or s <= 0:
-            return np.ones(len(xs), dtype=float) / len(xs)
-        return p / s
+        return np.asarray(self.clf.decision_function(X), dtype=float).reshape(-1)
+
+    def race_probs(self, xs: List[np.ndarray], temperature: float = 1.0) -> np.ndarray:
+        return softmax_scores(self.race_scores(xs), temperature)
 
 
 class MetricAccumulator:
@@ -483,48 +521,87 @@ def train_models(db_path: Path, holdout_days: int, burnin_days: int, batch_size:
     end = parse_iso_date(minmax[1])
     if (end - start).days < burnin_days + 60:
         raise RuntimeError(f"Not enough history: {start}..{end}")
+
     holdout_days = min(max(60, holdout_days), max(60, (end - start).days // 3))
     test_start = end - timedelta(days=holdout_days - 1)
+    calibration_days = max(30, holdout_days // 2)
+    validation_start = min(end, test_start + timedelta(days=calibration_days))
+    calibration_end = validation_start - timedelta(days=1)
     burnin_end = start + timedelta(days=burnin_days)
 
     print(f"v4 trainer {VERSION}")
     print(f"history={start}..{end} rows={minmax[2]:,}")
-    print(f"burn-in through {burnin_end - timedelta(days=1)} / holdout starts {test_start}")
+    print(f"burn-in through {burnin_end - timedelta(days=1)}")
+    print(f"temperature calibration={test_start}..{calibration_end}")
+    print(f"validation={validation_start}..{end}")
+    print("holdout is day-prequential: score all races using data/model through the previous day, then learn that day")
 
     state = HistoryState()
     base = OnlineModel("BASE", BASE_FEATURES, batch_size)
     weather = OnlineModel("WEATHER", WEATHER_FEATURES, batch_size)
     base_metric = MetricAccumulator()
     weather_metric = MetricAccumulator()
+    base_cal_samples: List[Tuple[np.ndarray, int]] = []
+    weather_cal_samples: List[Tuple[np.ndarray, int]] = []
+    base_temp: Optional[float] = None
+    weather_temp: Optional[float] = None
     seen_days = 0
 
     for day_s, day_rows in iter_rows_by_date(conn):
         day = parse_iso_date(day_s)
         day_ord = day.toordinal()
         seen_days += 1
-        is_train = burnin_end <= day < test_start
-        is_test = day >= test_start
+        can_train = day >= burnin_end
+        is_cal = test_start <= day < validation_start
+        is_validation = day >= validation_start
+        in_holdout = day >= test_start
+
+        # At holdout start and then each day, pending prior-day training must be committed before scoring today.
+        if in_holdout:
+            base.flush(); weather.flush()
+
+        # Freeze temperatures once, before the later validation segment starts.
+        if is_validation and base_temp is None:
+            base_temp = fit_temperature(base_cal_samples)
+            weather_temp = fit_temperature(weather_cal_samples)
+            print(f"  calibrated BASE temperature={base_temp:.6f} from {len(base_cal_samples):,} races")
+            print(f"  calibrated WEATHER temperature={weather_temp:.6f} from {len(weather_cal_samples):,} races")
+
+        day_base_train = []
+        day_weather_train = []
 
         for _, rs in valid_races(day_rows):
             winner_idx = next(i for i, r in enumerate(rs) if r[4] == 1)
             base_x = [vectorize(feature_dict(r, state, day_ord, False), BASE_FEATURES) for r in rs]
             y = [1 if i == winner_idx else 0 for i in range(6)]
 
-            if is_train:
-                base.add_race(base_x, y)
-            elif is_test:
-                base.flush()
-                base_metric.add(base.race_probs(base_x), winner_idx)
+            if can_train:
+                if is_cal:
+                    base_cal_samples.append((base.race_scores(base_x).copy(), winner_idx))
+                elif is_validation:
+                    base_metric.add(base.race_probs(base_x, base_temp or 1.0), winner_idx)
+                day_base_train.append((base_x, y))
 
             if weather_race_usable(rs):
                 wx = [vectorize(feature_dict(r, state, day_ord, True), WEATHER_FEATURES) for r in rs]
-                if is_train:
-                    weather.add_race(wx, y)
-                elif is_test:
-                    weather.flush()
-                    weather_metric.add(weather.race_probs(wx), winner_idx)
+                if can_train:
+                    if is_cal:
+                        weather_cal_samples.append((weather.race_scores(wx).copy(), winner_idx))
+                    elif is_validation:
+                        weather_metric.add(weather.race_probs(wx, weather_temp or 1.0), winner_idx)
+                    day_weather_train.append((wx, y))
 
-        # IMPORTANT: update history only after every race on this calendar date was featurized.
+        # Learn today's labels only after every race on this date has been scored.
+        if can_train:
+            for xs, y in day_base_train:
+                base.add_race(xs, y)
+            for xs, y in day_weather_train:
+                weather.add_race(xs, y)
+            # During holdout, flush once per day so tomorrow uses all information through today.
+            if in_holdout:
+                base.flush(); weather.flush()
+
+        # IMPORTANT: history features are also updated only after every race on this calendar date was featurized.
         for r in day_rows:
             if r[4] is not None:
                 state.add_day_row(r, day_ord)
@@ -534,13 +611,21 @@ def train_models(db_path: Path, holdout_days: int, burnin_days: int, batch_size:
 
     base.flush()
     weather.flush()
+    if base_temp is None:
+        base_temp = fit_temperature(base_cal_samples)
+    if weather_temp is None:
+        weather_temp = fit_temperature(weather_cal_samples)
     conn.close()
 
     if not base.fitted or not weather.fitted:
         raise RuntimeError("Model training did not receive enough usable races")
     return {
         "start": start, "end": end, "test_start": test_start,
+        "calibration_end": calibration_end, "validation_start": validation_start,
         "base": base, "weather": weather,
+        "base_temperature": float(base_temp), "weather_temperature": float(weather_temp),
+        "base_calibration_races": len(base_cal_samples),
+        "weather_calibration_races": len(weather_cal_samples),
         "base_metric": base_metric.summary(), "weather_metric": weather_metric.summary(),
     }
 
@@ -566,7 +651,14 @@ def write_meta(out_dir: Path, trained):
         ["モデルバージョン", VERSION],
         ["学習開始履歴日", trained["start"].isoformat()],
         ["学習終了履歴日", trained["end"].isoformat()],
-        ["ホールドアウト開始日", trained["test_start"].isoformat()],
+        ["Temperature校正開始日", trained["test_start"].isoformat()],
+        ["Temperature校正終了日", trained["calibration_end"].isoformat()],
+        ["検証開始日", trained["validation_start"].isoformat()],
+        ["検証終了日", trained["end"].isoformat()],
+        ["BASE_Temperature", round(trained["base_temperature"], 8)],
+        ["WEATHER_Temperature", round(trained["weather_temperature"], 8)],
+        ["BASE_校正レース数", trained["base_calibration_races"]],
+        ["WEATHER_校正レース数", trained["weather_calibration_races"]],
         ["BASE_学習レース数", trained["base"].train_races],
         ["WEATHER_学習レース数", trained["weather"].train_races],
         ["BASE_検証レース数", b["races"]],
@@ -579,8 +671,10 @@ def write_meta(out_dir: Path, trained):
         ["WEATHER_Brier", round(w["brier"], 6) if w["races"] else ""],
         ["WEATHER_LogLoss", round(w["logloss"], 6) if w["races"] else ""],
         ["WEATHER_実勝艇平均予測確率", round((w["winner_p"] or 0) * 100, 3) if w["races"] else ""],
+        ["確率方式", "6艇logitのレース単位Softmax + モデル別Temperature校正"],
+        ["検証方式", "前半holdoutでTemperatureを校正し、後半holdoutで検証。各レース予測後にのみオンライン学習。"],
         ["特徴量方針", "当日より前の結果だけで履歴特徴量を再構築。BASEは艇番をコース近似、WEATHERは風条件を追加。"],
-        ["用途", "v4.0影運用。NotebookLMは説明担当とし、確率計算はこのモデルを優先。"],
+        ["用途", "v4.0.1影運用。NotebookLMは説明担当とし、確率計算はこのモデルを優先。"],
         ["作成日時", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
     ]
     path = out_dir / "BR_model_v4_meta.csv"
